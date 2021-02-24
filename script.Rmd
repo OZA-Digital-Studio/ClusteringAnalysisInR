@@ -1,0 +1,285 @@
+### -- Clustering Analysis: Psoriasis Clinical Cases -- ###
+
+
+Settings:
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+# Install necessary packages (one-off)
+  #install.packages(c("stats", "cluster", "data.table", "dplyr","Rtsne","ggplot2", "dendextend","clValid"), dependencies=T)
+
+# Load necessary packages
+  library(stats)
+  library(cluster)
+  library(data.table)
+  library(dplyr)
+  library(Rtsne)
+  library(ggplot2)
+  library(dendextend)
+  library(clValid)
+
+
+# Set working directory
+  # CHANGE HERE: path to the folder where the files are located in your computer  
+  setwd("...ADD HERE YOUR FOLDER PATH/ClusteringAnalysis_PsoriasisClinicalCases/") 
+
+# Load dataset:
+  data <- data.table(read.csv("./dataset.csv"),stringsAsFactors = TRUE)
+```
+
+Dataset preparation:
+
+In this section, I will prepare the dataset, step-by-step, according to what has been agreed over our phone call
+```{r}
+  # 1. Exclude columns that are not important for the analysis. 
+
+  # If you decide to reconsider any of these columns, just delete them from this vector.
+
+  data <- data[,!c("Fecha.de.Toma", "PASI.TOTAL", "Primera.Consulta","PrimerPASI","DELTAPASI", "DIFFEchas","Nombre_municipio_paciente","Escolaridad_paciente","Promedio.de.Total.Global","Promedio.de.Salud.Fisica","Promedio.de.Relaciones.Interpersonales","Promedio.de.Entorno", "Promedio.de.Psicologica","Fecha_ultima_hospitalizacion", "TIPO_HOSPITALIZACION","Codigo_Diagnostico_Hospitalizacion","Riesgo_Seg_Farmaco","Adherente","fecha_Consulta")]
+  
+  # 2. There are multiple rows for the same patient, as each row corresponds to a doctor appointment (which could have been more than 1 per patient). Since the scope of the study is to see patterns related to the efficiency of the treatment, it has been decided to exclude from the analysis all those rows with "effectividad" = 0 and to consider only data from the last appointment per each patient. So, for example, if a patient has been visited 4 times, only the final %PASI calculated at the 4th appointment will be considered.
+  
+  data <- data[data$EFECTIVIDAD==1]
+  
+  # at which point, we do not need the efectividad column anymore since it is all equal to 1
+  data <- data[,!"EFECTIVIDAD"]
+  
+  # If you decide that you want to consider in the analysis also those patients with efectividad = 0, then comment out the above 2 lines
+  
+  # patients IDs
+  patientsIDs <- unique(data$ID.Paciente)
+  
+  for(i in 1:length(patientsIDs)){
+    
+    # which rows correspond to the ith patient?
+    patient_data <- which(data$ID.Paciente == patientsIDs[i])
+    
+    # if more than one row (NuConsulta>2) then:
+    if(length(patient_data)>1){
+      
+        # which is the row that corresponds to the last time the patient was seen by a doctor?
+        max <- which.max(data$NumCONSULTA[patient_data])
+        
+        # remove all those rows of the patient that num.consulta was lower than the max
+        to.remove <- patient_data[-max]
+        data <- data[-to.remove,] 
+    }
+  }
+  
+
+  # 3. Columns that refer to the different type of psoriasis have several NAs. Exclude rows/patients for which this information is not provided since clustering analysis do not accept NA values.
+  data <- na.omit(data)
+  
+  # your dataset has 658 patients and 49 variables/columns
+  #dim(data) 
+  
+  # 4. Distinguish between continuous, categorical, and binary variables
+  
+  # str(data) # some of this variables are actually categorical, not numerical/integers. 
+  # Example: Num consulta is not a continuous variable, but instead a categorical ordered variable
+  # Change columns class accordingly
+  
+  data$NumCONSULTA <- as.ordered(data$NumCONSULTA) 
+  # I am unsure whether it makes sense or not to use this column. The number of times a patient is treated could be relevant, or not. If you think it is not relevant, exclude this column from the dataset by un-commenting the below line of code:
+  # data <- data[,!'NumCONSULTA']
+
+  # All psoriasis types and treatments were also converted to factors, as they only provide values of 0 and 1
+  # Psoriasis-type and treatments are present in columns from 8 to 49.
+  
+  cols <- colnames(data)[8:ncol(data)]
+  data[,(cols):=lapply(.SD, as.factor),.SDcols=cols]
+  
+  #str(data) # just to check that everything worked fine (see each column class)
+```
+
+
+## Calculate a Dissimilarity Matrix: Gower Distance method ##
+
+Categorical variables such as 'genero', 'estado civil', etc cannot be used for calculating Euclidian distances, because the difference between, for example, a female(1) and a male(2) is not really a distance. For overcoming this problem, I have calculated Gower Distances instead, which provides a matrix of dissimilarities between points and it allows  both categorical and continuous variables to be considered in the analysis. Have a look at these links for detailed explanation:
+  
+  https://towardsdatascience.com/hierarchical-clustering-on-categorical-data-in-r-a27e578f2995
+  https://www.rdocumentation.org/packages/StatMatch/versions/1.2.0/topics/gower.dist
+  
+```{r}
+# Calculate a dissimilarity matrix with Gower Distance method
+
+  # In other words, see similarity between clinical cases.
+  # Gower distance ranges from 0 to 1. 
+  # I have excluded the first column which refers to the patients ID
+  # Values have been standardized ( stand = TRUE) as the different variables have different units
+  gower.dist <- daisy(data[,-1], stand = TRUE, metric = c("gower"))
+  summary(gower.dist)
+
+  # RESULT: The max difference you have obatined here is 0.27, which means your clinical cases are all quite similar among each other
+  # I have tried to exclude some of the variables to see whether differences would increase, but found similar results
+  
+  # save in a csv in case needed
+  write.csv(as.matrix(gower.dist), 
+  'GowersDistance_dissimilarityMatrix.csv', 
+  row.names=FALSE)
+```
+
+
+## Clustering Analysis
+
+Once you have calculated distances between points/patients, you shall apply a clustering analysis to see how they group with each other. That could be a:
+  
+  1. k-means clustering analysis which CANNOT be applied to your dataset as this analysis is only applicable to continuous variables. In your case, only age and %PASI are continuous. An analysis with only these two variables will give you no information about the treatment efficiency. Instead, a Partitioning Around Medoids analysis is applied (PAM), a more robust version of K-means. But also in this case, the analysis is valid if considering numeric variables.
+  
+  2. Hierarchical clustering analysis: accepts categorical and continuous variables
+  
+## 1. Partitioning around medoids analysis (PAM)  
+```{r}
+# Determine the ideal number of clusters to group the data (k) (we can assume that patients are grouped into 3,4,etc clusters. But with the Sillhouette Method we identify the ideal k value to use)
+  
+# Sillouhete method:
+  
+avg_silhouette <- c(NA)
+
+for(i in 2:10){
+  # 'pam' function partitions/cluster values into k-number of clusters
+  # diss=T indicates we are providing a dissimilarity matrix
+  cluster <- pam(gower.dist, diss=T, k=i)
+  
+  # store the Sillhouette avg width in the vector
+  avg_silhouette <- c(avg_silhouette, cluster$silinfo$avg.width)
+}
+
+plot(avg_silhouette,
+     xlim = c(1,10),
+     xlab="total number of clusters",
+     ylab="average sillouhette",
+     main = "Sillouhette method for defyining the ideal k",
+     bty="n",
+     type="o",
+     pch=16)
+abline(v= which.max(avg_silhouette), col="red", lty=2)
+
+k = which.max(avg_silhouette)
+
+# A high average sillhouette value indicates a good clustering
+# It seems that the highes Sillhouette values are obtained when partitioning/clustering your data into 3 clusters, so k=3
+
+# Therefore, let's calculate Gower Distance with a k= 3
+cluster <- pam(gower.dist, diss=T, k= k)
+table(cluster$clustering) # the 3 clusters are, respectively, composed of 229 117 252 patients
+
+# create a new column to store the value of each cluster to which each patient is assigned
+data <- cbind(data, cluster$clustering)
+colnames(data)[ncol(data)] <- "pam"
+
+# Let's see the average values of the continuous variables per each cluster
+# We can only consider these variables as all the remaining are binary/factors, so we cannot calculate their average
+avgs <- round(aggregate(data[,c('DELTAPASI.', 'Edad')], list(data$pam), mean),2)
+avgs[order(avgs$DELTAPASI.),]
+
+# Print results
+cluster$medoids
+round(cluster$clusinfo,2)
+
+# Summary of each cluster
+pam_results <- data %>%
+  mutate(cluster$clustering) %>%
+  group_by(cluster$clustering) %>%
+  do(the_summary = summary(.))
+
+# pam_results$the_summary
+
+# Plot clusters:  t-SNE is a method for constructing a low dimensional embedding of high-dimensional data, distances or similarities. 
+tsne_obj <- Rtsne(gower.dist, is_distance = TRUE)
+
+# create a df with the coordinates of each point and the cluster they have been assigned
+tsne_data <- tsne_obj$Y %>%
+  data.frame() %>%
+  setNames(c("X", "Y")) %>%
+  mutate(cluster = factor(cluster$clustering))
+
+# plot in a cartesian system
+ggplot(aes(x = X, y = Y, colour=cluster, fill=cluster), data = tsne_data)+  geom_point()+
+ geom_density2d()
+
+pdf(file= './PAM_clustering.pdf', width= 9, height= 9)
+
+ggplot(aes(x = X, y = Y, colour=cluster, fill=cluster), data = tsne_data)+
+ ggtitle('PAM Clustering')+
+ geom_point()+
+ geom_density2d()
+
+dev.off()
+```
+
+## 2. Hierarchical Clustering 
+```{r}
+# Choose the method you believe is more appropriate between these:"ward.D", "ward.D2", "single", "complete", "average" (= UPGMA), "mcquitty" (= WPGMA), "median" (= WPGMC) or "centroid" (= UPGMC).
+# Se info in: https://uc-r.github.io/hc_clustering#algorithms
+
+# This is the formula for calculating the dissimilarity matrix used at the start of the script. I have pasted it here again for convenience, but I have excluded from the dataset the columns where I stored the patient ID (1) and pam results (50)
+
+# gower.dist <- daisy(data[,-c(1, 50)], stand = TRUE, metric = c("gower"))
+#summary(gower.dist)
+
+# we will use the same dissimilarity matrix calculated above
+set.seed(658)
+cluster2 <- hclust(gower.dist, method="complete")
+
+# Cut the dendogram data in the k-number of groups and calculate a Dunn's Index to see the goodness of the cluster
+# Despite the ideal k number was 3, I have written a loop to see whether the Dunn's Index increases with different k values, because it was quite low at k=3
+
+for(i in 2:10){
+  sub_grp <- cutree(cluster2, k = i)
+  
+  # Dunn's Index: the ratio between the minimum inter-cluster distances to the maximum intra-cluster diameter. The diameter of a cluster is the distance between its two furthermost points. In order to have well separated and compact clusters you should aim for a higher Dunn's index. It has a value from 0 to infinite.
+  
+  print(paste0("If k= ", i, " then Dunn's Index = ", round(dunn(distance = as.matrix(gower.dist), clusters= sub_grp),2)))
+}
+
+# Dunn's Index do not vary much changing k-values. Also, I have tried to run the analyzes again with all the other algorithms and the maximum Dunn'Index value obatined is anyway 0.4 with k=2
+
+# Print height results. If you wish to see other results frrom the cluster just call the 'cluster$' list and select the voice you need 
+# cluster2$height
+
+# I will keep the original k value calculated with the Sillouhette method
+sub_grp <- cutree(cluster2, k = k)
+table(sub_grp)
+
+# save cluster number in the main dataset
+data <- cbind(data,sub_grp)
+colnames(data)[ncol(data)] <- 'Hclust'
+
+# Check averages per each group
+x1 <- round(aggregate(data[,c('DELTAPASI.', 'Edad')], list(data$Hclust), mean),2)
+x1[order(x1$DELTAPASI.),]
+
+# Dendogram 1: dendogram with labels and squares around the clusters - It is very complex, because you have a lot of data. Consider subsetting your dataset and re-calculating Gower Distance on a random subsample
+plot(cluster2, cex = 0.6, labels=FALSE)
+rect.hclust(cluster2, k = 7, border = 2:7)
+abline(h = 7, col = 'red')
+
+# Dendogram 2: coloured branches - easier to be analysed
+avg_dend_obj <- as.dendrogram(cluster2)
+avg_col_dend <- color_branches(avg_dend_obj, h = 0.22)
+plot(avg_col_dend,
+     main= "Hierarchical clustering",
+     xlab="patients",
+     ylab= "Height")
+
+# save in pdf
+pdf(file= './Hierarchical_clustering.pdf', width= 15, height= 9)
+plot(avg_col_dend,
+     main= "Hierarchical clustering",
+     xlab="patients",
+     ylab= "Height")
+dev.off()
+
+# See whether there is any linear relationship between the age of the patients and the %PASI and whether that varies between groups
+ggplot(data, aes(x= data$Edad, y = data$DELTAPASI., color = factor(Hclust))) + 
+  geom_point() +
+  labs(colour = factor("Hclust"),
+       x = "Edad",
+       y = "% PASI")
+
+# There is no correlation between age and % PASI
+
+```
+
+### CONCLUSIONS: 
+
+Overall, I believe the PAM analysis as well as the k-means do not suit your type of dataset, since they are robust when considering continuous data. The Hierarchical Clustering analysis evidenced weak Dunn's  indices, suggesting that the clustering is not consistent. Considering that the maximum average Gower Distance calculated is of 0.27, I believe the overall result is that there isn't much difference between clinical cases independently of their age, genre, status or the type of treatment they have received. Perhaps play around the script a little bit, excluding some more variables from the analysis in the 'Dataset preparation' section and even reducing the dataset to a  subsample of patients. (Maybe considering females and males separately and running the analysis in two different groups?)
